@@ -1,0 +1,116 @@
+name: CI-CD  # Название workflow, отображается в GitHub Actions UI
+
+on:
+  push:
+    branches: [main]  # Запускается при пуше в ветку main
+
+jobs:
+  # 🧱 Сборка образа с тегом по SHA
+  build:
+    runs-on: self-hosted  # Запуск на своём runner
+
+    outputs:  # Передаём тег для следующих job
+      image-tag: ${{ steps.set-tag.outputs.tag }}
+
+    steps:
+      - name: Клонирование репозитория
+        uses: actions/checkout@v3
+
+      - name: Установка тега по SHA коммита
+        id: set-tag
+        run: echo "tag=myapp:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Сборка builder-образа (для тестов)
+        run: docker build --target builder -t ${{ steps.set-tag.outputs.tag }} .
+
+  # ✅ Тестирование
+  test:
+    runs-on: self-hosted
+    needs: build  # Запускается после успешного build
+
+    # Временный PostgreSQL для тестов
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_DB: kubsu
+          POSTGRES_USER: kubsu
+          POSTGRES_PASSWORD: kubsu
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kubsu"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:  # Локальные переменные окружения для тестов
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: kubsu
+      DB_USER: kubsu
+      DB_PASS: kubsu
+
+    steps:
+      - name: Клонирование кода
+        uses: actions/checkout@v3
+
+      - name: Ожидание PostgreSQL
+        run: |
+          until pg_isready -h ${{ env.DB_HOST }} -p ${{ env.DB_PORT }} -U ${{ env.DB_USER }}; do
+            echo "⏳ Waiting for Postgres..."
+            sleep 2
+          done
+
+      - name: Запуск тестов
+        run: |
+          docker run --rm \
+            --network host \
+            -e PYTHONPATH=/app \
+            -e DB_HOST=${{ env.DB_HOST }} \
+            -e DB_PORT=${{ env.DB_PORT }} \
+            -e DB_NAME=${{ env.DB_NAME }} \
+            -e DB_USER=${{ env.DB_USER }} \
+            -e DB_PASS=${{ env.DB_PASS }} \
+            ${{ needs.build.outputs.image-tag }} \
+            pytest tests
+
+  # 🚀 Деплой
+  deploy:
+    runs-on: self-hosted
+    needs: [build, test]  # Запускается только после успешных build и test
+
+    env:
+      IMAGE_NAME: myapp
+
+    steps:
+      - name: Клонирование кода
+        uses: actions/checkout@v3
+
+      - name: Настройка SSH-агента
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Сборка финального образа
+        run: docker build -t ${{ env.IMAGE_NAME }}:final .
+
+      - name: Деплой на сервер через SSH
+        run: |
+          echo "🚀 Деплой на удалённый сервер..."
+
+          # Загружаем образ на удалённую машину
+          docker save ${{ env.IMAGE_NAME }}:final | ssh -o StrictHostKeyChecking=no \
+            -p ${{ secrets.PORT }} \
+            ${{ secrets.USER }}@${{ secrets.HOST }} \
+            "podman load && podman tag ${{ env.IMAGE_NAME }}:final ${{ env.IMAGE_NAME }}:final"
+
+          # Перезапускаем контейнер
+          ssh -o StrictHostKeyChecking=no \
+            -p ${{ secrets.PORT }} \
+            ${{ secrets.USER }}@${{ secrets.HOST }} \
+            "podman stop ${{ env.IMAGE_NAME }} || true && \
+             podman rm ${{ env.IMAGE_NAME }} || true && \
+             podman run -d --name ${{ env.IMAGE_NAME }} \
+             --network=host \
+             ${{ env.IMAGE_NAME }}:final"
