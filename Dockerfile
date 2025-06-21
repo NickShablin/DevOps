@@ -46,4 +46,4 @@ ENV PATH="/home/appuser/.local/bin:${PATH}"
 USER appuser
 
 # Команда по умолчанию
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8070"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8068"]
